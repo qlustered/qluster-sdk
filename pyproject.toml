@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qluster_sdk"
+version = "2.77.0"
+description = "SDK for writing custom validation, correction, and enrichment rules for the Qluster platform"
+requires-python = ">=3.12"
+authors = [
+    { name = "Qluster Engineering", email = "support@getqluster.com" },
+]
+
+readme = { file = "README.md", content-type = "markdown" }
+
+dependencies = [
+    "pydantic>=2.0",
+    "packaging>=21.0",
+]
+
+# your PyPI classifiers go here
+classifiers = [
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Development Status :: 5 - Production/Stable",
+]
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.2",
+    "pytest-cov==7.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+# This configuration assumes your packages are in the root of your project (where pyproject.toml is).
+# If your packages are in a directory like 'src', use: where = ["src"]
+exclude = ["tests*", "docs*"]
+
+
+[tool.flake8]
+max-line-length = 120
+builtins = "json"
+statistics = true
+ignore = "E202"
+exclude = "./data,./src,./tests,.svn,CVS,.bzr,.hg,.git,__pycache__,./.venv"
+
+[tool.pytest.ini_options]

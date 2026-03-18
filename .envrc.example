@@ -1,0 +1,2 @@
+# Replace "my-sdk-venv" with the name of your virtualenv
+load_venv my-sdk-venv

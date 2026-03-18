@@ -1,0 +1,6 @@
+{
+    "venvPath": "/path/to/your/venvs/",
+    "venv": "atlas",
+    "extraPaths": [
+    ]
+}
