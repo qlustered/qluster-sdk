@@ -12,13 +12,13 @@ authors = [
 ]
 
 readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
 
 dependencies = [
     "pydantic>=2.0",
     "packaging>=21.0",
 ]
 
-# your PyPI classifiers go here
 classifiers = [
   "Intended Audience :: Developers",
   "Operating System :: OS Independent",
@@ -52,12 +52,5 @@ include-package-data = true
 # If your packages are in a directory like 'src', use: where = ["src"]
 exclude = ["tests*", "docs*"]
 
-
-[tool.flake8]
-max-line-length = 120
-builtins = "json"
-statistics = true
-ignore = "E202"
-exclude = "./data,./src,./tests,.svn,CVS,.bzr,.hg,.git,__pycache__,./.venv"
 
 [tool.pytest.ini_options]

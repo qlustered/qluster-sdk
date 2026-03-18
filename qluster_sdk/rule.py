@@ -90,7 +90,7 @@ class IssueType(EnumStrBase):
     bad_looking_lastname = "bad_looking_lastname"
     bad_looking_fullname = "bad_looking_fullname"
     unknown_time_unit = "unknown_time_unit"
-    unknown_temprature_unit = "unknown_temprature_unit"
+    unknown_temperature_unit = "unknown_temperature_unit"
     invalid_us_zip = "invalid_us_zip"
     invalid_email = "invalid_email"
     invalid_upc = "invalid_upc"

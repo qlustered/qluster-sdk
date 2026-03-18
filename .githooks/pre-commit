@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# This repo is READ-ONLY. It is extracted from atlas/qluster-sdk.
+# All changes must be made in the atlas repo, then extracted via: make gitpush-sdk
+echo ""
+echo "ERROR: Direct commits to qluster-sdk are not allowed."
+echo ""
+echo "  This is a read-only repo extracted from atlas/qluster-sdk."
+echo "  Make your changes in the atlas repo, then run:"
+echo ""
+echo "    make gitpush-sdk"
+echo ""
+exit 1
