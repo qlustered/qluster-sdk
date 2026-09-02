@@ -1,4 +1,4 @@
-# Qluster SDK
+# Qluster SDK 2.111.1
 
 The Qluster SDK lets you write custom **validation**, **correction**, and **enrichment** rules that run inside the Qluster data pipeline. You subclass `Rule`, declare metadata and typed parameters, and implement an `apply()` method that inspects each row and returns a `RuleResult`.
 
@@ -75,7 +75,7 @@ print(result.corrections)  # {"price": 100.0}
 The base class for all rules. Every rule must define:
 
 - **`ParamsModel`** -- a Pydantic `BaseModel` subclass that declares the rule's configuration parameters.
-- **`metadata`** -- a `RuleMetadata` instance declaring the rule's semantic version, which columns it reads, validates, corrects, or enriches, and the allowed alert actions.
+- **`metadata`** -- a `RuleMetadata` instance declaring the rule's semantic version, which columns it reads, validates, corrects, or enriches, the allowed alert actions, and `default_treat_as_alert` (default `True`) -- set it to `False` for a rule that only ever emits warning-severity issues, so its instances are not created as blocking alerts.
 - **`apply(row) -> RuleResult`** -- the per-row logic. Access columns via `row["field_name"]` or `row.get("field_name")`.
 
 The rule's **name** is auto-generated from the class name (e.g. `PriceShoesRule` becomes `"price-shoes-rule"`). You can set it explicitly with a class attribute `name = "my-rule"`.

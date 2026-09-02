@@ -1,5 +1,10 @@
 import os
 import sys
+from atlas_test_support.pytest_markers import (
+    pytest_addoption,
+    pytest_configure,
+    pytest_collection_modifyitems,
+)
 
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),

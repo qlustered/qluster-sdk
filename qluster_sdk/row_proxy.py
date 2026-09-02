@@ -36,6 +36,21 @@ class RowProxy(Mapping[str, Any]):
     When you access ``row["price"]``, RowProxy looks up ``colmap.get("price", "price")``
     to find the actual column name, then returns ``raw_row[actual_column]``.
 
+    Absent keys
+    -----------
+    ``absent_keys`` marks rule field names as *definitively absent*: ``get()``
+    returns the default, ``[]`` raises ``CellNotFound``, ``in`` is False, and
+    iteration skips any raw column whose name collides with an absent key —
+    all checked **before** the colmap identity fallback. Because ``keys()``,
+    ``items()``, ``values()``, ``dict(proxy)`` and ``==`` are derived from
+    ``__iter__``/``__getitem__`` by ``Mapping``, every view agrees: a raw
+    column shadowed by an unbound optional is invisible under that name (its
+    data stays reachable through whatever rule field name is bound to it).
+    ``repr()``/``str()`` intentionally still show the full raw row, for
+    debugging. ``Rule.check()`` uses this for declared-but-unbound
+    ``optional_columns`` so an unbound operand can never alias a same-named
+    real dataset column.
+
     Example
     -------
     ::
@@ -49,13 +64,22 @@ class RowProxy(Mapping[str, Any]):
 
     If no mapping exists for a key, the key itself is used (identity mapping).
     """
-    __slots__ = ("_raw", "_colmap")
+    __slots__ = ("_raw", "_colmap", "_absent")
 
-    def __init__(self, raw: RawRow, colmap: ColMap | None) -> None:
+    def __init__(
+        self,
+        raw: RawRow,
+        colmap: ColMap | None,
+        *,
+        absent_keys: frozenset[str] = frozenset(),
+    ) -> None:
         self._raw    = deepcopy(raw)
         self._colmap = colmap or {}
+        self._absent = absent_keys
 
     def __getitem__(self, key: str) -> Any:
+        if key in self._absent:
+            raise CellNotFound(repr(key))
         actual = self._colmap.get(key, key)
         try:
             return self._raw[actual]
@@ -63,18 +87,29 @@ class RowProxy(Mapping[str, Any]):
             raise CellNotFound(str(err)) from None
 
     def get(self, key: str, default: Any = None) -> Any:
+        if key in self._absent:
+            return default
         actual = self._colmap.get(key, key)
         return self._raw.get(actual, default)
 
     def __iter__(self):
-        yield from self._raw
+        if not self._absent:
+            yield from self._raw
+            return
+        for key in self._raw:
+            if key not in self._absent:
+                yield key
 
     def __len__(self) -> int:
-        return len(self._raw)
+        if not self._absent:
+            return len(self._raw)
+        return sum(1 for key in self._raw if key not in self._absent)
 
     def __contains__(self, key: object) -> bool:
         match key:
             case str():
+                if key in self._absent:
+                    return False
                 actual = self._colmap.get(key, key)
                 return actual in self._raw
             case _:

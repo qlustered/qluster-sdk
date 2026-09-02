@@ -2,7 +2,7 @@ import pytest
 import uuid
 from typing import Any
 from pydantic import BaseModel, Field
-from qluster_sdk.rule import Rule, RuleMetadata, RuleResult, Issue, _auto_slugify, _validate_slug, VALID_SLUG_RE
+from qluster_sdk.rule import Rule, RuleMetadata, RuleResult, Issue, ProblemDomainBinding, _auto_slugify, _validate_slug, VALID_SLUG_RE
 
 class PriceShoesParams(BaseModel):
     max_price: float = Field(
@@ -25,6 +25,7 @@ class PriceShoesRule(Rule):
     """
     metadata = RuleMetadata(release="0.0.1")
     ParamsModel = PriceShoesParams
+    business_summary = "Flags shoes priced above the allowed maximum and optionally caps the price to the limit."
     # ResolveActionsParams = {
     #     "resolve_action1": ResolveAction1Params
     # }
@@ -77,7 +78,8 @@ class TestPriceShoesRule:
             self.dataset_rule_id,
             {"max_price": 100.0, "correction_strategy": "quarantine"},
         )
-        assert "price-shoes-rule" == PriceShoesRule.name
+        assert PriceShoesRule.name == "PriceShoesRule"
+        assert PriceShoesRule.slug == "price-shoes-rule"
 
     def test_non_shoes_row_passes(self):
         row = {"product_type": "hat", "price": 1000.0}
@@ -214,19 +216,21 @@ class TestValidateSlug:
 class TestExplicitNameValidation:
     def test_valid_explicit_name_accepted(self):
         class MyCustomRule(Rule):
-            name = "my-custom-rule"
+            name = "My Custom Rule"
             metadata = RuleMetadata(release="0.0.1")
+            business_summary = "Test rule with explicit name."
             class ParamsModel(BaseModel):
                 pass
             def apply(self, row):
                 return RuleResult()
 
-        assert MyCustomRule.name == "my-custom-rule"
+        assert MyCustomRule.name == "My Custom Rule"
+        assert MyCustomRule.slug == "my-custom-rule"
 
-    def test_invalid_explicit_name_raises(self):
+    def test_invalid_explicit_slug_raises(self):
         with pytest.raises(ValueError, match="Invalid rule name"):
-            class BadNameRule(Rule):
-                name = "Not A Valid Slug"
+            class BadSlugRule(Rule):
+                slug = "Not A Valid Slug"
                 metadata = RuleMetadata(release="0.0.1")
                 class ParamsModel(BaseModel):
                     pass
@@ -236,22 +240,170 @@ class TestExplicitNameValidation:
     def test_auto_generated_name_still_works(self):
         class AutoNameRule(Rule):
             metadata = RuleMetadata(release="0.0.1")
+            business_summary = "Test rule with auto-generated name."
             class ParamsModel(BaseModel):
                 pass
             def apply(self, row):
                 return RuleResult()
 
-        assert AutoNameRule.name == "auto-name-rule"
+        assert AutoNameRule.name == "AutoNameRule"
+        assert AutoNameRule.slug == "auto-name-rule"
 
     def test_error_suggests_auto_slug(self):
-        with pytest.raises(ValueError, match="commission-math-rule") as exc_info:
+        with pytest.raises(ValueError, match="commission-math-rule"):
             class CommissionMathRule(Rule):
-                name = "CommissionMathRule"
+                slug = "CommissionMathRule"
                 metadata = RuleMetadata(release="0.0.1")
                 class ParamsModel(BaseModel):
                     pass
                 def apply(self, row):
                     return RuleResult()
+
+
+class TestProblemDomainBinding:
+    def test_valid_single_binding(self):
+        m = RuleMetadata(
+            release="1.0.0",
+            validates_columns=["Gross Amount", "Agency Comm Amount"],
+            problem_domain_bindings=[
+                ProblemDomainBinding(
+                    problem_domain_slug="broker-commission-bordereau",
+                    field_kind_slug_by_rule_field={
+                        "Gross Amount": "gross_amount",
+                        "Agency Comm Amount": "agency_comm_amount",
+                    },
+                ),
+            ],
+        )
+        assert len(m.problem_domain_bindings) == 1
+        assert m.problem_domain_bindings[0].problem_domain_slug == "broker-commission-bordereau"
+
+    def test_valid_multiple_bindings(self):
+        m = RuleMetadata(
+            release="1.0.0",
+            validates_columns=["col-a"],
+            problem_domain_bindings=[
+                ProblemDomainBinding("kind-one", {"col-a": "field-a"}),
+                ProblemDomainBinding("kind-two", {"col-a": "field-b"}),
+            ],
+        )
+        assert len(m.problem_domain_bindings) == 2
+
+    def test_empty_bindings_allowed(self):
+        m = RuleMetadata(release="1.0.0", validates_columns=["col-a"])
+        assert m.problem_domain_bindings == []
+
+    def test_invalid_problem_domain_slug(self):
+        with pytest.raises(ValueError, match="Invalid dataset kind slug"):
+            RuleMetadata(
+                release="1.0.0",
+                validates_columns=["col"],
+                problem_domain_bindings=[
+                    ProblemDomainBinding("INVALID_SLUG", {"col": "ok"}),
+                ],
+            )
+
+    def test_invalid_field_kind_slug(self):
+        with pytest.raises(ValueError, match="Invalid dataset field kind slug"):
+            RuleMetadata(
+                release="1.0.0",
+                validates_columns=["col"],
+                problem_domain_bindings=[
+                    ProblemDomainBinding("valid-kind", {"col": "BAD SLUG"}),
+                ],
+            )
+
+    def test_duplicate_problem_domain_slug(self):
+        with pytest.raises(ValueError, match="Duplicate dataset kind binding"):
+            RuleMetadata(
+                release="1.0.0",
+                validates_columns=["col"],
+                problem_domain_bindings=[
+                    ProblemDomainBinding("same-kind", {"col": "slug-a"}),
+                    ProblemDomainBinding("same-kind", {"col": "slug-b"}),
+                ],
+            )
+
+    def test_missing_affected_columns(self):
+        with pytest.raises(ValueError, match="missing field-kind bindings for affected columns"):
+            RuleMetadata(
+                release="1.0.0",
+                validates_columns=["col-a", "col-b"],
+                problem_domain_bindings=[
+                    ProblemDomainBinding("my-kind", {"col-a": "slug-a"}),
+                ],
+            )
+
+    def test_extra_unknown_field_names(self):
+        with pytest.raises(ValueError, match="unknown rule field names"):
+            RuleMetadata(
+                release="1.0.0",
+                validates_columns=["col-a"],
+                problem_domain_bindings=[
+                    ProblemDomainBinding("my-kind", {"col-a": "slug-a", "extra": "slug-x"}),
+                ],
+            )
+
+    def test_affected_columns_across_all_column_types(self):
+        """Bindings must cover all affected columns (input + validates + corrects + enriches)."""
+        m = RuleMetadata(
+            release="1.0.0",
+            input_columns=["inp"],
+            validates_columns=["val"],
+            corrects_columns=["cor"],
+            enriches_columns=["enr"],
+            problem_domain_bindings=[
+                ProblemDomainBinding("my-kind", {
+                    "inp": "slug-inp",
+                    "val": "slug-val",
+                    "cor": "slug-cor",
+                    "enr": "slug-enr",
+                }),
+            ],
+        )
+        assert set(m.affected_columns) == {"inp", "val", "cor", "enr"}
+        assert len(m.problem_domain_bindings) == 1
+
+    def test_missing_affected_column_names_in_error(self):
+        """Error message should name the missing columns."""
+        with pytest.raises(ValueError, match="col-b") as exc_info:
+            RuleMetadata(
+                release="1.0.0",
+                validates_columns=["col-a", "col-b"],
+                problem_domain_bindings=[
+                    ProblemDomainBinding("my-kind", {"col-a": "slug-a"}),
+                ],
+            )
+        assert "my-kind" in str(exc_info.value)
+
+    def test_binding_is_namedtuple(self):
+        b = ProblemDomainBinding("my-kind", {"col": "slug"})
+        assert b.problem_domain_slug == "my-kind"
+        assert b.field_kind_slug_by_rule_field == {"col": "slug"}
+        # NamedTuple indexing
+        assert b[0] == "my-kind"
+        assert b[1] == {"col": "slug"}
+
+    def test_rule_class_with_bindings(self):
+        """ProblemDomainBinding works correctly when used in a Rule subclass."""
+        class MyParams(BaseModel):
+            pass
+
+        class MyRule(Rule[MyParams]):
+            metadata = RuleMetadata(
+                release="1.0.0",
+                validates_columns=["amount"],
+                problem_domain_bindings=[
+                    ProblemDomainBinding("broker-commission-bordereau", {"amount": "gross_amount"}),
+                ],
+            )
+            ParamsModel = MyParams
+            business_summary = "Test rule."
+
+            def apply(self, row):
+                return RuleResult()
+
+        assert len(MyRule.metadata.problem_domain_bindings) == 1
 
 
 class TestColumnMapping:
@@ -282,6 +434,7 @@ class TestColumnMapping:
         # Define an inline rule that enriches "y" when "x" == "foo"
         class EnrichRule(Rule):
             metadata = RuleMetadata(release="0.0.1")
+            business_summary = "Enriches column y with a derived value when column x matches a target."
             class ParamsModel(BaseModel):
                 pass
 

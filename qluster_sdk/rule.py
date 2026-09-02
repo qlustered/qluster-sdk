@@ -7,14 +7,19 @@ import uuid as _uuid
 import sys as _sys
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone as _tz
-from typing import Generic, Type, TypeVar, Any, Optional, ClassVar
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from typing import Generic, NamedTuple, TypeVar, Any, Optional, ClassVar, cast
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from packaging.version import Version, InvalidVersion
-
 from qluster_sdk.row_proxy import RowProxy, RawRow, ColMap
+from orderly_set import StableSetEq
 
-# Type variable for pydantic params
-ParamsT = TypeVar("ParamsT", bound=BaseModel)
+class _EmptyParams(BaseModel):
+    """Default params model for rules that declare no parameters."""
+
+
+# Type variable for pydantic params. Defaults to an empty params model so
+# rules without parameters don't need to declare a ParamsModel.
+ParamsT = TypeVar("ParamsT", bound=BaseModel, default=_EmptyParams)
 
 # Alias mappings for compact wire serialization
 _ISSUE_ALIASES = {
@@ -27,6 +32,7 @@ _ISSUE_ALIASES = {
     "issue_type": "t",
     "severity": "s",
     "publisher": "pb",
+    "stack_trace": "tb",
 }
 
 _RR_ALIASES = {
@@ -56,12 +62,15 @@ class IssueType(EnumStrBase):
     validation_problem = "validation_problem"  # When we have trouble validating something 
     rule_validation = "rule_validation"  # validation warnings that all other validation warnings are subclass of
     rule_bug = "rule_bug"  # A bug in the rule
+    guest_failure = "guest_failure"  # The sandbox died or returned no result for a rule. Infra fault, not the rule's fault.
+    user_submitted = "user_submitted"  # A human flagged one or more cells of a row. No rule produced this.
 
     anomaly = "anomaly"  # An anomaly is detected. The user has the option to modify the value or declare this value as not an anomaly
     invalid_keyword = "invalid_keyword"
     not_nullable = "not_nullable"
     out_of_range = "out_of_range"
     required_field = "required_field"
+    required_field_missing = "required_field_missing"
 
     invalid_us_address_line = "invalid_us_address_line"  # Address line is invalid
     invalid_us_address_line2 = "invalid_us_address_line2"  # Address line is invalid
@@ -105,6 +114,10 @@ class IssueType(EnumStrBase):
     car_model_belongs_to_another_make = "car_model_belongs_to_another_make"
     unknown_apparel_size = "unknown_apparel_size"
     invalid_language = "invalid_language"
+    vin_invalid_format = "vin_invalid_format"
+    vin_invalid_check_digit = "vin_invalid_check_digit"
+    vin_unknown_wmi = "vin_unknown_wmi"
+    duplicate_row = "duplicate_row"  # A row is a byte-identical content duplicate of another row in the same data source. Blocking Alert when quarantined; non-blocking Warning when admitted to clean.
 
 
 
@@ -147,7 +160,7 @@ class Issue(BaseModel):
         default="",
         description="What published the issue"
     )
-    issue_pattern: Optional[str] = Field(
+    issue_pattern: str | None = Field(
         default=None,
         description=(
             "Optional aggregation pattern. "
@@ -161,6 +174,13 @@ class Issue(BaseModel):
     allowed_alert_actions: list[RuleAlertAction] | None = Field(default=None, description="optional per-issue override; if None → fall back to rule default")
     issue_type: IssueType = Field(default=IssueType.rule_validation, description="It has to be one of Qluster's supported issue types. In most cases you don't need to provide this.")
     severity: IssueSeverity = Field(default=IssueSeverity.blocker, description="Is this a warning or a blocker issue that causes an alert?")
+    stack_trace: str = Field(
+        default="",
+        description=(
+            "Set by the runtime, not by rules. When a rule raises, this carries "
+            "the traceback so the resulting alert can name the failing line."
+        ),
+    )
 
     @field_validator("field_names", mode="before")
     @classmethod
@@ -235,6 +255,121 @@ class RuleResult(BaseModel):
         return cls.model_validate(blob)
 
 
+SLUG_REGEX = re.compile(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+VALID_SLUG_RE = re.compile(r'^[a-z][a-z0-9]*(-[a-z0-9]+)*$')
+VALID_FIELD_KIND_SLUG_RE = re.compile(r'^[a-z][a-z0-9]*([_-][a-z0-9]+)*$')
+
+
+def _auto_slugify(name: str) -> str:
+    """
+    Convert CamelCase or PascalCase into lowercase, hyphen-separated words,
+    but keep consecutive uppercase letters (acronyms) grouped together.
+
+    E.g.:
+      "MyCoolRule"   → "my-cool-rule"
+      "XMLParser"    → "xml-parser"
+      "HTTPRequest"  → "http-request"
+      "Rule2Test"    → "rule2-test"
+    """
+    # Insert hyphen between:
+    #  1) lowercase/digit and uppercase
+    #  2) uppercase followed by uppercase+lowercase (acronym boundary)
+    return SLUG_REGEX.sub('-', name).lower()
+
+
+def _validate_slug_format(slug: str, label: str) -> None:
+    """Validate that a string matches the valid slug format."""
+    if not VALID_SLUG_RE.match(slug):
+        raise ValueError(
+            f"Invalid {label} {slug!r}: must match {VALID_SLUG_RE.pattern!r}."
+        )
+
+
+def _validate_slug(name: str, class_name: str) -> None:
+    if VALID_SLUG_RE.match(name):
+        return
+    suggested = _auto_slugify(class_name)
+    raise ValueError(
+        f"Invalid rule name {name!r}: must be a valid slug matching "
+        f"{VALID_SLUG_RE.pattern!r}.\n"
+        f"  Hint: did you mean {suggested!r}? "
+        f"(Remove the explicit `name` to auto-generate from the class name.)"
+    )
+
+
+class ProblemDomainBinding(NamedTuple):
+    """Maps a dataset kind to a complete rule-field → dataset-field-kind-slug binding."""
+    problem_domain_slug: str
+    field_kind_slug_by_rule_field: dict[str, str]
+
+
+def _validate_problem_domain_bindings(
+    bindings: list[ProblemDomainBinding],
+    affected_columns: list[str],
+) -> None:
+    """Validate dataset kind bindings against affected columns."""
+    if not bindings:
+        return
+
+    # Duplicate dataset kind slugs
+    seen_slugs: set[str] = set()
+    for binding in bindings:
+        if binding.problem_domain_slug in seen_slugs:
+            raise ValueError(
+                f"Duplicate dataset kind binding for slug {binding.problem_domain_slug!r}."
+            )
+        seen_slugs.add(binding.problem_domain_slug)
+
+    affected_set = set(affected_columns)
+
+    for binding in bindings:
+        _validate_slug_format(binding.problem_domain_slug, "dataset kind slug")
+
+        for field_kind_slug in binding.field_kind_slug_by_rule_field.values():
+            if not VALID_FIELD_KIND_SLUG_RE.match(field_kind_slug):
+                raise ValueError(
+                    f"Invalid dataset field kind slug {field_kind_slug!r}: "
+                    f"must match {VALID_FIELD_KIND_SLUG_RE.pattern!r}."
+                )
+
+        mapping_keys = set(binding.field_kind_slug_by_rule_field.keys())
+
+        missing = affected_set - mapping_keys
+        if missing:
+            raise ValueError(
+                f"Dataset kind {binding.problem_domain_slug!r} is missing field-kind "
+                f"bindings for affected columns: {sorted(missing)}."
+            )
+
+        extra = mapping_keys - affected_set
+        if extra:
+            raise ValueError(
+                f"Dataset kind {binding.problem_domain_slug!r} has unknown rule field "
+                f"names in field-kind binding map: {sorted(extra)}."
+            )
+
+
+class EnrichedFieldSchema(BaseModel):
+    """Declared Atlas model-schema field definition for a column this rule
+    enriches/produces. Self-contained in qluster-sdk (leaf package) — it does
+    NOT import any backend schema type. Extra Atlas model-schema keys
+    (datetime_formats, is_dollar, is_percent, etc.) are allowed and preserved.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = Field(
+        ..., description="Atlas column type, e.g. 'Decimal', 'Date', 'String'."
+    )
+    is_nullable: bool = Field(
+        default=True, description="Whether the produced column is nullable."
+    )
+    precision: int | None = Field(
+        default=None, description="Numeric precision (Decimal)."
+    )
+    scale: int | None = Field(default=None, description="Numeric scale (Decimal).")
+
+
 class RuleMetadata(BaseModel):
     """
     Declare which columns this rule reads, validates, corrects, or enriches.
@@ -301,6 +436,24 @@ class RuleMetadata(BaseModel):
         default_factory=list,
         description="Column names this rule may enrich/add. Uses the same naming as input_columns.",
     )
+    enriched_field_schemas: dict[str, EnrichedFieldSchema] = Field(
+        default_factory=dict,
+        description=(
+            "Per-column declared schema for columns this rule enriches/produces. "
+            "Keys must be a subset of enriches_columns. The backend persists these "
+            "as the produced column's field_schema (the wizard reads them read-only)."
+        ),
+    )
+    optional_columns: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Read-side columns (declared in input_columns/validates_columns) that "
+            "MAY be left unbound in a DatasetRule's rule_column_mapping. Inside "
+            "apply(), an unbound optional column reads as absent: row.get(name) "
+            "returns the default and row[name] raises CellNotFound. Must not "
+            "include corrects/enriches (write-side) columns or '*'."
+        ),
+    )
 
     allowed_alert_actions: list[RuleAlertAction] = Field(
         default_factory=lambda: [
@@ -311,6 +464,36 @@ class RuleMetadata(BaseModel):
         ],
         description="Static list of resolve actions enabled for this rule.",
     )
+
+    default_treat_as_alert: bool = Field(
+        True,
+        description=(
+            "Default for DatasetRule.treat_as_alert when this rule is instantiated. "
+            "The instantiating user or the API may still override it, and changing "
+            "this on a later revision never touches DatasetRules that already exist. "
+            "Declare False for a rule that only ever emits warning-severity issues, "
+            "so its instances are not born as blocking alerts. Distinct from the "
+            "per-Issue `severity` axis: treat_as_alert gates whether a *blocker* "
+            "issue quarantines the row; it never promotes a warning."
+        ),
+    )
+
+    problem_domain_bindings: list[ProblemDomainBinding] = Field(
+        default_factory=list,
+        description=(
+            "Supported dataset kinds for this rule revision, with a complete mapping "
+            "from each affected rule field name to a ProblemDomainField slug for that dataset kind."
+        ),
+    )
+
+    @property
+    def affected_columns(self) -> list[str]:
+        return list(
+            StableSetEq(self.input_columns)
+            | StableSetEq(self.validates_columns)
+            | StableSetEq(self.corrects_columns)
+            | StableSetEq(self.enriches_columns)
+        )
 
     # field_validator runs on author-submitted payload
     @field_validator("release")
@@ -323,37 +506,33 @@ class RuleMetadata(BaseModel):
             raise ValueError(f"Invalid semantic version: {v!r}")
         return v
 
-SLUG_REGEX = re.compile(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
-VALID_SLUG_RE = re.compile(r'^[a-z][a-z0-9]*(-[a-z0-9]+)*$')
-
-
-def _auto_slugify(name: str) -> str:
-    """
-    Convert CamelCase or PascalCase into lowercase, hyphen-separated words,
-    but keep consecutive uppercase letters (acronyms) grouped together.
-
-    E.g.:
-      "MyCoolRule"   → "my-cool-rule"
-      "XMLParser"    → "xml-parser"
-      "HTTPRequest"  → "http-request"
-      "Rule2Test"    → "rule2-test"
-    """
-    # Insert hyphen between:
-    #  1) lowercase/digit and uppercase
-    #  2) uppercase followed by uppercase+lowercase (acronym boundary)
-    return SLUG_REGEX.sub('-', name).lower()
-
-
-def _validate_slug(name: str, class_name: str) -> None:
-    if VALID_SLUG_RE.match(name):
-        return
-    suggested = _auto_slugify(class_name)
-    raise ValueError(
-        f"Invalid rule name {name!r}: must be a valid slug matching "
-        f"{VALID_SLUG_RE.pattern!r}.\n"
-        f"  Hint: did you mean {suggested!r}? "
-        f"(Remove the explicit `name` to auto-generate from the class name.)"
-    )
+    @model_validator(mode="after")
+    def _check_problem_domain_bindings(self):
+        _validate_problem_domain_bindings(self.problem_domain_bindings, self.affected_columns)
+        unknown = set(self.enriched_field_schemas) - set(self.enriches_columns)
+        if unknown:
+            raise ValueError(
+                f"enriched_field_schemas keys must be enriches_columns; "
+                f"unknown: {sorted(unknown)}"
+            )
+        optional = set(self.optional_columns)
+        if "*" in optional:
+            raise ValueError(
+                "optional_columns may not contain '*' (a wildcard is not a bindable column)"
+            )
+        unknown_optional = optional - set(self.input_columns) - set(self.validates_columns)
+        if unknown_optional:
+            raise ValueError(
+                f"optional_columns must be declared in input_columns or "
+                f"validates_columns; unknown: {sorted(unknown_optional)}"
+            )
+        write_side = optional & (set(self.corrects_columns) | set(self.enriches_columns))
+        if write_side:
+            raise ValueError(
+                f"optional_columns may not include write-side "
+                f"(corrects/enriches) columns: {sorted(write_side)}"
+            )
+        return self
 
 
 class ExecutionContext:
@@ -426,13 +605,21 @@ class Rule(ABC, Generic[ParamsT]):
     """
     Base class for validation / correction / enrichment rules.
     Subclasses must provide:
-      • ParamsModel: subclass of BaseModel defining typed params
       • metadata: an instance of RuleMetadata
+      • limitations: some rules are deterministic and obvious, others are heuristic, approximate, or dependent on incomplete data
+      • business_summary: Rule formula explained in plain English for business users
       • apply(): the per-row logic
+    Subclasses may optionally provide:
+      • ParamsModel: subclass of BaseModel defining typed params. Defaults to an
+        empty params model for rules that take no parameters.
     """
-    ParamsModel: Type[ParamsT]
+    ParamsModel: type[ParamsT] = cast(type[ParamsT], _EmptyParams)
     metadata: RuleMetadata
     name: ClassVar[str]
+    slug: ClassVar[str]
+    business_summary: ClassVar[str]
+    limitations: ClassVar[str | None] = None
+    LINEAGE_ID: ClassVar[uuid.UUID | None] = None
 
 
     def __init_subclass__(cls) -> None:
@@ -447,10 +634,15 @@ class Rule(ABC, Generic[ParamsT]):
         super().__init_subclass__()
         # If the subclass did not set a `name` attribute, auto-generate it
         if 'name' not in cls.__dict__:
-            cls.name = _auto_slugify(cls.__name__)
-        else:
-            _validate_slug(cls.name, cls.__name__)
+            cls.name = cls.__name__
 
+        if 'slug' not in cls.__dict__:
+            cls.slug = _auto_slugify(cls.__name__)
+        else:
+            _validate_slug(cls.slug, cls.__name__)
+        if 'business_summary' not in cls.__dict__:
+            raise ValueError("You need to define a business_summary for the rule that is the plain English description of the rule for business users.")
+        
     def __init__(
         self,
         dataset_rule_id: uuid.UUID,
@@ -533,8 +725,17 @@ class Rule(ABC, Generic[ParamsT]):
         2) Call existing apply()
         3) Remap the tiny corrections/enrichments dicts back
            to the real column names in one pass.
+
+        Declared-but-unbound optional_columns are passed to RowProxy as
+        absent_keys so an unbound operand reads as absent instead of
+        identity-falling-back onto a same-named dataset column.
         """
-        proxy  = RowProxy(raw_row, self.rule_column_mapping)
+        metadata = getattr(type(self), "metadata", None)
+        declared_optional = getattr(metadata, "optional_columns", None) or []
+        absent = frozenset(
+            name for name in declared_optional if name not in self.rule_column_mapping
+        )
+        proxy  = RowProxy(raw_row, self.rule_column_mapping, absent_keys=absent)
         result = self.apply(proxy)
         if result.issues:
             for issue in result.issues:

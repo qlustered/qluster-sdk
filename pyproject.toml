@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qluster_sdk"
-version = "2.77.0"
+version = "2.111.1"
 description = "SDK for writing custom validation, correction, and enrichment rules for the Qluster platform"
 requires-python = ">=3.12"
 authors = [
@@ -16,6 +16,7 @@ license = "MIT"
 
 dependencies = [
     "pydantic>=2.0",
+    "deepdiff==9.1.0",
     "packaging>=21.0",
 ]
 
@@ -32,9 +33,9 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest==9.0.2",
-    "pytest-cov==7.0.0",
-    "ruff>=0.4.0",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.16.0",
 ]
 
 [project.urls]
@@ -54,3 +55,4 @@ exclude = ["tests*", "docs*"]
 
 
 [tool.pytest.ini_options]
+pythonpath = ["../test_support"]

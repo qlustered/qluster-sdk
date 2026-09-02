@@ -1,8 +1,9 @@
-__version__ = "2.77.0"
+__version__ = "2.111.1"
 
 __all__ = [
     "Rule",
     "RuleMetadata",
+    "EnrichedFieldSchema",
     "RuleResult",
     "Issue",
     "IssueSeverity",
@@ -19,6 +20,7 @@ __all__ = [
 from qluster_sdk.rule import (
     Rule,
     RuleMetadata,
+    EnrichedFieldSchema,
     RuleResult,
     Issue,
     IssueSeverity,
