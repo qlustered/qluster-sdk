@@ -7,7 +7,7 @@ import uuid as _uuid
 import sys as _sys
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone as _tz
-from typing import Generic, NamedTuple, TypeVar, Any, Optional, ClassVar, cast
+from typing import Generic, Literal, TypeVar, Any, ClassVar, cast
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from packaging.version import Version, InvalidVersion
 from qluster_sdk.row_proxy import RowProxy, RawRow, ColMap
@@ -57,6 +57,20 @@ class IssueSeverity(EnumStrBase):
     blocker = "blocker"        # quarantines a row
 
 
+class RuleSeverity(EnumStrBase):
+    """What a rule instance does with the severity its issues declare."""
+
+    warning = "warning"          # every issue this rule raises warns
+    blocker = "blocker"          # every issue this rule raises quarantines the row
+    as_declared = "as_declared"  # each issue keeps the severity the rule gave it
+
+    def resolve(self, declared: IssueSeverity) -> IssueSeverity:
+        """The effective severity of an issue this rule declared ``declared``."""
+        if self is RuleSeverity.as_declared:
+            return declared
+        return IssueSeverity(self.value)
+
+
 class IssueType(EnumStrBase):
     validation = "validation"  # validation warnings that all other validation warnings are subclass of
     validation_problem = "validation_problem"  # When we have trouble validating something 
@@ -103,6 +117,7 @@ class IssueType(EnumStrBase):
     invalid_us_zip = "invalid_us_zip"
     invalid_email = "invalid_email"
     invalid_upc = "invalid_upc"
+    upc_unknown_gtin_prefix = "upc_unknown_gtin_prefix"
     invalid_basic_upc = "invalid_basic_upc"
     invalid_gpc = "invalid_gpc"
     invalid_phone = "invalid_phone"
@@ -116,7 +131,10 @@ class IssueType(EnumStrBase):
     invalid_language = "invalid_language"
     vin_invalid_format = "vin_invalid_format"
     vin_invalid_check_digit = "vin_invalid_check_digit"
+    vin_invalid_model_year_code = "vin_invalid_model_year_code"
     vin_unknown_wmi = "vin_unknown_wmi"
+    vin_model_year_mismatch = "vin_model_year_mismatch"
+    vin_make_mismatch = "vin_make_mismatch"
     duplicate_row = "duplicate_row"  # A row is a byte-identical content duplicate of another row in the same data source. Blocking Alert when quarantined; non-blocking Warning when admitted to clean.
 
 
@@ -194,8 +212,6 @@ class Issue(BaseModel):
 class RuleResult(BaseModel):
     """
     Outcome of applying a Rule to a single row.
-    - If `alert_issue` then the row is not valid and it blocks the row.
-    - `warning_issues` do not block.
     - `corrections` apply *before* `enrichments`.
     - `modification_reasons_per_field` joins correction + enrichment reasons.
     """
@@ -246,9 +262,6 @@ class RuleResult(BaseModel):
         Both aliased keys (``"i"``, ``"c"``, ``"e"``, ``"m"``) and full field names
         (``"issues"``, ``"corrections"``, etc.) are accepted, thanks to
         ``populate_by_name=True`` in the model config.
-
-        This is mainly useful in tests; in production the platform deserializes
-        wire dicts automatically via Pydantic model validation.
         """
         if isinstance(blob, str):
             return cls.model_validate_json(blob)
@@ -257,7 +270,7 @@ class RuleResult(BaseModel):
 
 SLUG_REGEX = re.compile(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
 VALID_SLUG_RE = re.compile(r'^[a-z][a-z0-9]*(-[a-z0-9]+)*$')
-VALID_FIELD_KIND_SLUG_RE = re.compile(r'^[a-z][a-z0-9]*([_-][a-z0-9]+)*$')
+VALID_CONCEPT_SLUG_RE = re.compile(r'^[a-z][a-z0-9]*([_-][a-z0-9]+)*$')
 
 
 def _auto_slugify(name: str) -> str:
@@ -277,14 +290,6 @@ def _auto_slugify(name: str) -> str:
     return SLUG_REGEX.sub('-', name).lower()
 
 
-def _validate_slug_format(slug: str, label: str) -> None:
-    """Validate that a string matches the valid slug format."""
-    if not VALID_SLUG_RE.match(slug):
-        raise ValueError(
-            f"Invalid {label} {slug!r}: must match {VALID_SLUG_RE.pattern!r}."
-        )
-
-
 def _validate_slug(name: str, class_name: str) -> None:
     if VALID_SLUG_RE.match(name):
         return
@@ -297,56 +302,35 @@ def _validate_slug(name: str, class_name: str) -> None:
     )
 
 
-class ProblemDomainBinding(NamedTuple):
-    """Maps a dataset kind to a complete rule-field → dataset-field-kind-slug binding."""
-    problem_domain_slug: str
-    field_kind_slug_by_rule_field: dict[str, str]
+#: Every Atlas field type name a rule may name in a column type declaration.
+#: Mirrors ``common.types.FieldType``; qluster-sdk is a leaf package and must
+#: not import the backend enum.
+FIELD_TYPE_NAMES: frozenset[str] = frozenset({
+    "String",
+    "Text",
+    "UUID",
+    "SmallInteger",
+    "Integer",
+    "BigInteger",
+    "Decimal",
+    "Float",
+    "DateTime",
+    "Date",
+    "Boolean",
+    "Array",
+    "BigIntArray",
+    "IntArray",
+    "UUIDArray",
+    "Json",
+    "Jsonb",
+    "Bytea",
+    "Varbit",
+    "SmallIntArray",
+})
 
-
-def _validate_problem_domain_bindings(
-    bindings: list[ProblemDomainBinding],
-    affected_columns: list[str],
-) -> None:
-    """Validate dataset kind bindings against affected columns."""
-    if not bindings:
-        return
-
-    # Duplicate dataset kind slugs
-    seen_slugs: set[str] = set()
-    for binding in bindings:
-        if binding.problem_domain_slug in seen_slugs:
-            raise ValueError(
-                f"Duplicate dataset kind binding for slug {binding.problem_domain_slug!r}."
-            )
-        seen_slugs.add(binding.problem_domain_slug)
-
-    affected_set = set(affected_columns)
-
-    for binding in bindings:
-        _validate_slug_format(binding.problem_domain_slug, "dataset kind slug")
-
-        for field_kind_slug in binding.field_kind_slug_by_rule_field.values():
-            if not VALID_FIELD_KIND_SLUG_RE.match(field_kind_slug):
-                raise ValueError(
-                    f"Invalid dataset field kind slug {field_kind_slug!r}: "
-                    f"must match {VALID_FIELD_KIND_SLUG_RE.pattern!r}."
-                )
-
-        mapping_keys = set(binding.field_kind_slug_by_rule_field.keys())
-
-        missing = affected_set - mapping_keys
-        if missing:
-            raise ValueError(
-                f"Dataset kind {binding.problem_domain_slug!r} is missing field-kind "
-                f"bindings for affected columns: {sorted(missing)}."
-            )
-
-        extra = mapping_keys - affected_set
-        if extra:
-            raise ValueError(
-                f"Dataset kind {binding.problem_domain_slug!r} has unknown rule field "
-                f"names in field-kind binding map: {sorted(extra)}."
-            )
+#: What a rule accepts in one read-side column: a non-empty list of
+#: FIELD_TYPE_NAMES entries, or the literal "any".
+ColumnTypeDecl = list[str] | Literal["any"]
 
 
 class EnrichedFieldSchema(BaseModel):
@@ -374,6 +358,27 @@ class RuleMetadata(BaseModel):
     """
     Declare which columns this rule reads, validates, corrects, or enriches.
 
+    Declaring
+    ---------
+    Assign ``metadata = RuleMetadata(...)`` directly in the rule's class body
+    and write every keyword as a literal: constants; list, tuple and dict
+    literals, such as ``column_concepts={"price": "asking_price"}``; calls
+    with keyword arguments only, such as ``EnrichedFieldSchema(type=...)``;
+    and ``RuleSeverity.<member>`` or ``RuleAlertAction.<member>``.
+    Submission reads the metadata from the
+    source without importing the file, and rejects a keyword it cannot read
+    as a literal: a helper call, a comprehension, a module-level name,
+    ``**kwargs`` or a call with positional arguments. Submission also rejects
+    a keyword this model does not define; the model itself ignores it.
+
+    Column Types
+    ------------
+    ``column_field_types`` has exactly one entry per read-side column
+    (``input_columns``, ``validates_columns`` and ``corrects_columns``, minus
+    ``'*'``): a non-empty list of ``FIELD_TYPE_NAMES`` entries, or ``"any"``.
+    Enriched columns are typed by ``enriched_field_schemas``, and a column
+    that is both read and enriched must accept its produced type.
+
     Column Naming and Mapping
     -------------------------
     The column names in this metadata are the names your rule code will use to
@@ -381,25 +386,12 @@ class RuleMetadata(BaseModel):
     "rule field names" or "generic column names".
 
     When a rule is attached to a dataset, a **column mapping** connects your
-    rule field names to the actual dataset column names. There are two approaches:
+    rule field names to the actual dataset column names.
 
-    1. **Manual Mapping (Recommended for Production)**:
-       When creating a DatasetRule via the API, you provide an explicit mapping:
-       ``{"price": "product_price", "name": "item_name"}``
-       This maps your rule's "price" field to the dataset's "product_price" column.
-
-    2. **Auto Mapping (For Testing Only)**:
-       The ``create_all_custom_rules_for_dataset`` method can auto-generate mappings.
-       It assumes ``input_columns`` contain names that, when normalized, match
-       the dataset column names. This works if:
-
-       - You use raw header names: ``input_columns=["Product Price"]`` normalizes
-         to ``"product_price"`` which matches the dataset column.
-       - You use the wildcard ``"*"``: expands to all dataset column names with
-         identity mapping.
-
-       Auto-mapping does NOT work if you use arbitrary logical names like
-       ``["price"]`` when the dataset has ``"product_price"``.
+    **Manual Mapping**:
+    When creating a DatasetRule via the API, you provide an explicit mapping:
+    ``{"price": "product_price", "name": "item_name"}``
+    This maps your rule's "price" field to the dataset's "product_price" column.
 
     Example
     -------
@@ -444,6 +436,16 @@ class RuleMetadata(BaseModel):
             "as the produced column's field_schema (the wizard reads them read-only)."
         ),
     )
+    column_field_types: dict[str, ColumnTypeDecl] = Field(
+        default_factory=dict,
+        description=(
+            "Accepted Atlas field types for every read-side column "
+            "(input_columns | validates_columns | corrects_columns, minus '*'). "
+            "A list means 'any of these'; the literal 'any' means the rule "
+            "genuinely accepts any type. Produced columns are typed by "
+            "enriched_field_schemas instead."
+        ),
+    )
     optional_columns: list[str] = Field(
         default_factory=list,
         description=(
@@ -465,24 +467,23 @@ class RuleMetadata(BaseModel):
         description="Static list of resolve actions enabled for this rule.",
     )
 
-    default_treat_as_alert: bool = Field(
-        True,
+    default_severity: RuleSeverity = Field(
+        default=RuleSeverity.as_declared,
         description=(
-            "Default for DatasetRule.treat_as_alert when this rule is instantiated. "
+            "Default for DatasetRule.severity when this rule is instantiated. "
             "The instantiating user or the API may still override it, and changing "
             "this on a later revision never touches DatasetRules that already exist. "
-            "Declare False for a rule that only ever emits warning-severity issues, "
-            "so its instances are not born as blocking alerts. Distinct from the "
-            "per-Issue `severity` axis: treat_as_alert gates whether a *blocker* "
-            "issue quarantines the row; it never promotes a warning."
+            "`as_declared` lets each Issue keep the severity the rule gave it; "
+            "declare `warning` for a rule whose issues must never quarantine a row, "
+            "or `blocker` for one whose every issue must."
         ),
     )
 
-    problem_domain_bindings: list[ProblemDomainBinding] = Field(
-        default_factory=list,
+    column_concepts: dict[str, str] = Field(
+        default_factory=dict,
         description=(
-            "Supported dataset kinds for this rule revision, with a complete mapping "
-            "from each affected rule field name to a ProblemDomainField slug for that dataset kind."
+            "Rule field name -> concept slug. Keys must be affected columns other "
+            "than '*'; a field not listed is generic."
         ),
     )
 
@@ -494,6 +495,18 @@ class RuleMetadata(BaseModel):
             | StableSetEq(self.corrects_columns)
             | StableSetEq(self.enriches_columns)
         )
+
+    @property
+    def read_side_columns(self) -> list[str]:
+        """Columns the rule reads, excluding the wildcard. These are the
+        columns column_field_types declares a type for."""
+        return [
+            col
+            for col in StableSetEq(self.input_columns)
+            | StableSetEq(self.validates_columns)
+            | StableSetEq(self.corrects_columns)
+            if col != "*"
+        ]
 
     # field_validator runs on author-submitted payload
     @field_validator("release")
@@ -507,8 +520,19 @@ class RuleMetadata(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_problem_domain_bindings(self):
-        _validate_problem_domain_bindings(self.problem_domain_bindings, self.affected_columns)
+    def _check_column_declarations(self):
+        unknown_concept_keys = set(self.column_concepts) - (set(self.affected_columns) - {"*"})
+        if unknown_concept_keys:
+            raise ValueError(
+                f"column_concepts keys must be affected columns other than '*'; "
+                f"unknown: {sorted(unknown_concept_keys)}"
+            )
+        for col, concept_slug in self.column_concepts.items():
+            if not VALID_CONCEPT_SLUG_RE.fullmatch(concept_slug):
+                raise ValueError(
+                    f"column_concepts[{col!r}] has invalid concept slug {concept_slug!r}; "
+                    f"must match {VALID_CONCEPT_SLUG_RE.pattern!r}"
+                )
         unknown = set(self.enriched_field_schemas) - set(self.enriches_columns)
         if unknown:
             raise ValueError(
@@ -532,6 +556,59 @@ class RuleMetadata(BaseModel):
                 f"optional_columns may not include write-side "
                 f"(corrects/enriches) columns: {sorted(write_side)}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_column_field_types(self):
+        if "*" in self.column_field_types:
+            raise ValueError(
+                "column_field_types may not contain '*' (a wildcard is not a typed column)"
+            )
+
+        read_side = set(self.read_side_columns)
+        missing = read_side - set(self.column_field_types)
+        if missing:
+            raise ValueError(f"column_field_types missing: {sorted(missing)}")
+
+        unknown = set(self.column_field_types) - read_side
+        if unknown:
+            raise ValueError(
+                f"column_field_types has unknown columns: {sorted(unknown)}; "
+                f"only read-side columns (input/validates/corrects) are typed here, "
+                f"produced columns are typed by enriched_field_schemas"
+            )
+
+        for col, decl in self.column_field_types.items():
+            if decl == "any":
+                continue
+            if not decl:
+                raise ValueError(
+                    f"column_field_types[{col!r}] is empty; list at least one "
+                    f"field type or declare 'any'"
+                )
+            for entry in decl:
+                if entry not in FIELD_TYPE_NAMES:
+                    raise ValueError(
+                        f"column_field_types[{col!r}] has unknown field type {entry!r}; "
+                        f"expected one of {sorted(FIELD_TYPE_NAMES)}"
+                    )
+
+        enriched = {col for col in self.enriches_columns if col != "*"}
+        missing_schemas = enriched - set(self.enriched_field_schemas)
+        if missing_schemas:
+            raise ValueError(
+                f"enriched_field_schemas missing: {sorted(missing_schemas)}"
+            )
+
+        for col in sorted(enriched & read_side):
+            decl = self.column_field_types[col]
+            produced = self.enriched_field_schemas[col].type
+            if decl != "any" and produced not in decl:
+                raise ValueError(
+                    f"column {col!r} is both read and produced, but "
+                    f"column_field_types[{col!r}]={decl!r} does not accept the "
+                    f"produced type {produced!r}"
+                )
         return self
 
 
@@ -620,6 +697,7 @@ class Rule(ABC, Generic[ParamsT]):
     business_summary: ClassVar[str]
     limitations: ClassVar[str | None] = None
     LINEAGE_ID: ClassVar[uuid.UUID | None] = None
+    _row_filter: dict[str, Any] | None = None
 
 
     def __init_subclass__(cls) -> None:

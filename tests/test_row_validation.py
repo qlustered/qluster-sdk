@@ -2,7 +2,7 @@ import pytest
 import uuid
 from typing import Any
 from pydantic import BaseModel, Field
-from qluster_sdk.rule import Rule, RuleMetadata, RuleResult, Issue, ProblemDomainBinding, _auto_slugify, _validate_slug, VALID_SLUG_RE
+from qluster_sdk.rule import Rule, RuleMetadata, RuleResult, Issue, _auto_slugify, _validate_slug, VALID_SLUG_RE, VALID_CONCEPT_SLUG_RE
 
 class PriceShoesParams(BaseModel):
     max_price: float = Field(
@@ -260,142 +260,80 @@ class TestExplicitNameValidation:
                     return RuleResult()
 
 
-class TestProblemDomainBinding:
-    def test_valid_single_binding(self):
+class TestColumnConcepts:
+    def test_default_is_empty(self):
+        m = RuleMetadata(release="1.0.0", validates_columns=["col-a"], column_field_types={"col-a": "any"})
+        assert m.column_concepts == {}
+
+    def test_partial_map_is_valid(self):
         m = RuleMetadata(
             release="1.0.0",
-            validates_columns=["Gross Amount", "Agency Comm Amount"],
-            problem_domain_bindings=[
-                ProblemDomainBinding(
-                    problem_domain_slug="broker-commission-bordereau",
-                    field_kind_slug_by_rule_field={
-                        "Gross Amount": "gross_amount",
-                        "Agency Comm Amount": "agency_comm_amount",
-                    },
-                ),
-            ],
+            validates_columns=["price", "note"],
+            column_concepts={"price": "asking_price"},
+            column_field_types={"price": "any", "note": "any"},
         )
-        assert len(m.problem_domain_bindings) == 1
-        assert m.problem_domain_bindings[0].problem_domain_slug == "broker-commission-bordereau"
+        assert m.column_concepts == {"price": "asking_price"}
 
-    def test_valid_multiple_bindings(self):
-        m = RuleMetadata(
-            release="1.0.0",
-            validates_columns=["col-a"],
-            problem_domain_bindings=[
-                ProblemDomainBinding("kind-one", {"col-a": "field-a"}),
-                ProblemDomainBinding("kind-two", {"col-a": "field-b"}),
-            ],
-        )
-        assert len(m.problem_domain_bindings) == 2
-
-    def test_empty_bindings_allowed(self):
-        m = RuleMetadata(release="1.0.0", validates_columns=["col-a"])
-        assert m.problem_domain_bindings == []
-
-    def test_invalid_problem_domain_slug(self):
-        with pytest.raises(ValueError, match="Invalid dataset kind slug"):
-            RuleMetadata(
-                release="1.0.0",
-                validates_columns=["col"],
-                problem_domain_bindings=[
-                    ProblemDomainBinding("INVALID_SLUG", {"col": "ok"}),
-                ],
-            )
-
-    def test_invalid_field_kind_slug(self):
-        with pytest.raises(ValueError, match="Invalid dataset field kind slug"):
-            RuleMetadata(
-                release="1.0.0",
-                validates_columns=["col"],
-                problem_domain_bindings=[
-                    ProblemDomainBinding("valid-kind", {"col": "BAD SLUG"}),
-                ],
-            )
-
-    def test_duplicate_problem_domain_slug(self):
-        with pytest.raises(ValueError, match="Duplicate dataset kind binding"):
-            RuleMetadata(
-                release="1.0.0",
-                validates_columns=["col"],
-                problem_domain_bindings=[
-                    ProblemDomainBinding("same-kind", {"col": "slug-a"}),
-                    ProblemDomainBinding("same-kind", {"col": "slug-b"}),
-                ],
-            )
-
-    def test_missing_affected_columns(self):
-        with pytest.raises(ValueError, match="missing field-kind bindings for affected columns"):
-            RuleMetadata(
-                release="1.0.0",
-                validates_columns=["col-a", "col-b"],
-                problem_domain_bindings=[
-                    ProblemDomainBinding("my-kind", {"col-a": "slug-a"}),
-                ],
-            )
-
-    def test_extra_unknown_field_names(self):
-        with pytest.raises(ValueError, match="unknown rule field names"):
-            RuleMetadata(
-                release="1.0.0",
-                validates_columns=["col-a"],
-                problem_domain_bindings=[
-                    ProblemDomainBinding("my-kind", {"col-a": "slug-a", "extra": "slug-x"}),
-                ],
-            )
-
-    def test_affected_columns_across_all_column_types(self):
-        """Bindings must cover all affected columns (input + validates + corrects + enriches)."""
+    def test_keys_from_every_affected_column_list_are_accepted(self):
         m = RuleMetadata(
             release="1.0.0",
             input_columns=["inp"],
             validates_columns=["val"],
             corrects_columns=["cor"],
             enriches_columns=["enr"],
-            problem_domain_bindings=[
-                ProblemDomainBinding("my-kind", {
-                    "inp": "slug-inp",
-                    "val": "slug-val",
-                    "cor": "slug-cor",
-                    "enr": "slug-enr",
-                }),
-            ],
+            column_concepts={
+                "inp": "concept-inp",
+                "val": "concept_val",
+                "cor": "concept-cor",
+                "enr": "concept_enr",
+            },
+            column_field_types={"inp": "any", "val": "any", "cor": "any"},
+            enriched_field_schemas={"enr": {"type": "Text"}},
         )
-        assert set(m.affected_columns) == {"inp", "val", "cor", "enr"}
-        assert len(m.problem_domain_bindings) == 1
+        assert set(m.column_concepts) == {"inp", "val", "cor", "enr"}
 
-    def test_missing_affected_column_names_in_error(self):
-        """Error message should name the missing columns."""
-        with pytest.raises(ValueError, match="col-b") as exc_info:
+    def test_key_that_is_not_an_affected_column_is_rejected(self):
+        with pytest.raises(ValueError, match=r"column_concepts keys must be affected columns") as exc_info:
             RuleMetadata(
                 release="1.0.0",
-                validates_columns=["col-a", "col-b"],
-                problem_domain_bindings=[
-                    ProblemDomainBinding("my-kind", {"col-a": "slug-a"}),
-                ],
+                validates_columns=["col-a"],
+                column_concepts={"col-a": "concept-a", "zeta": "concept-z", "extra": "concept-x"},
+                column_field_types={"col-a": "any"},
             )
-        assert "my-kind" in str(exc_info.value)
+        assert "['extra', 'zeta']" in str(exc_info.value)
 
-    def test_binding_is_namedtuple(self):
-        b = ProblemDomainBinding("my-kind", {"col": "slug"})
-        assert b.problem_domain_slug == "my-kind"
-        assert b.field_kind_slug_by_rule_field == {"col": "slug"}
-        # NamedTuple indexing
-        assert b[0] == "my-kind"
-        assert b[1] == {"col": "slug"}
+    def test_wildcard_key_is_rejected(self):
+        with pytest.raises(ValueError, match=r"column_concepts keys must be affected columns") as exc_info:
+            RuleMetadata(
+                release="1.0.0",
+                input_columns=["*", "price"],
+                column_concepts={"*": "asking_price"},
+                column_field_types={"price": "any"},
+            )
+        assert "['*']" in str(exc_info.value)
 
-    def test_rule_class_with_bindings(self):
-        """ProblemDomainBinding works correctly when used in a Rule subclass."""
+    def test_invalid_slug_value_is_rejected(self):
+        with pytest.raises(ValueError, match="column_concepts") as exc_info:
+            RuleMetadata(
+                release="1.0.0",
+                validates_columns=["price"],
+                column_concepts={"price": "Bad Slug"},
+                column_field_types={"price": "any"},
+            )
+        message = str(exc_info.value)
+        assert "'Bad Slug'" in message
+        assert VALID_CONCEPT_SLUG_RE.pattern in message
+
+    def test_rule_class_declaring_column_concepts(self):
         class MyParams(BaseModel):
             pass
 
         class MyRule(Rule[MyParams]):
             metadata = RuleMetadata(
                 release="1.0.0",
-                validates_columns=["amount"],
-                problem_domain_bindings=[
-                    ProblemDomainBinding("broker-commission-bordereau", {"amount": "gross_amount"}),
-                ],
+                validates_columns=["amount", "memo"],
+                column_concepts={"amount": "gross_amount"},
+                column_field_types={"amount": "any", "memo": "any"},
             )
             ParamsModel = MyParams
             business_summary = "Test rule."
@@ -403,7 +341,7 @@ class TestProblemDomainBinding:
             def apply(self, row):
                 return RuleResult()
 
-        assert len(MyRule.metadata.problem_domain_bindings) == 1
+        assert MyRule.metadata.column_concepts == {"amount": "gross_amount"}
 
 
 class TestColumnMapping:

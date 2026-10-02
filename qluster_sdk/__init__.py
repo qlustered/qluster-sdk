@@ -1,13 +1,15 @@
-__version__ = "2.111.1"
+__version__ = "2.126.0"
 
 __all__ = [
     "Rule",
     "RuleMetadata",
     "EnrichedFieldSchema",
+    "FIELD_TYPE_NAMES",
     "RuleResult",
     "Issue",
     "IssueSeverity",
     "IssueType",
+    "RuleSeverity",
     "RuleAlertAction",
     "ExecutionContext",
     "RowProxy",
@@ -21,10 +23,12 @@ from qluster_sdk.rule import (
     Rule,
     RuleMetadata,
     EnrichedFieldSchema,
+    FIELD_TYPE_NAMES,
     RuleResult,
     Issue,
     IssueSeverity,
     IssueType,
+    RuleSeverity,
     RuleAlertAction,
     ExecutionContext,
 )

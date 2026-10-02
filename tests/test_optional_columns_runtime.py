@@ -59,6 +59,7 @@ class TwoOperandRule(Rule[_P]):
         input_columns=["value", "value_2"],
         validates_columns=["value"],
         optional_columns=["value_2"],
+        column_field_types={"value": "any", "value_2": "any"},
     )
     business_summary = "Compares value to value_2 when bound."
     ParamsModel = _P
@@ -161,6 +162,7 @@ class IteratingRule(Rule[_P]):
         input_columns=["value", "value_2"],
         validates_columns=["value"],
         optional_columns=["value_2"],
+        column_field_types={"value": "any", "value_2": "any"},
     )
     business_summary = "Snapshots the whole row via Mapping iteration."
     ParamsModel = _P

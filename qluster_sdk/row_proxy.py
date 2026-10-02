@@ -47,9 +47,7 @@ class RowProxy(Mapping[str, Any]):
     column shadowed by an unbound optional is invisible under that name (its
     data stays reachable through whatever rule field name is bound to it).
     ``repr()``/``str()`` intentionally still show the full raw row, for
-    debugging. ``Rule.check()`` uses this for declared-but-unbound
-    ``optional_columns`` so an unbound operand can never alias a same-named
-    real dataset column.
+    debugging.
 
     Example
     -------
@@ -64,7 +62,7 @@ class RowProxy(Mapping[str, Any]):
 
     If no mapping exists for a key, the key itself is used (identity mapping).
     """
-    __slots__ = ("_raw", "_colmap", "_absent")
+    __slots__ = ("_raw", "_colmap", "_absent", "_copied", "_copy_memo")
 
     def __init__(
         self,
@@ -73,24 +71,32 @@ class RowProxy(Mapping[str, Any]):
         *,
         absent_keys: frozenset[str] = frozenset(),
     ) -> None:
-        self._raw    = deepcopy(raw)
+        self._raw    = raw.copy()
         self._colmap = colmap or {}
         self._absent = absent_keys
+        self._copied: dict[str, Any] = {}
+        self._copy_memo: dict[int, Any] = {}
+
+    def _read(self, actual: str) -> Any:
+        if actual not in self._copied:
+            self._copied[actual] = deepcopy(self._raw[actual], self._copy_memo)
+        return self._copied[actual]
 
     def __getitem__(self, key: str) -> Any:
         if key in self._absent:
             raise CellNotFound(repr(key))
         actual = self._colmap.get(key, key)
-        try:
-            return self._raw[actual]
-        except KeyError as err:
-            raise CellNotFound(str(err)) from None
+        if actual not in self._raw:
+            raise CellNotFound(repr(actual))
+        return self._read(actual)
 
     def get(self, key: str, default: Any = None) -> Any:
         if key in self._absent:
             return default
         actual = self._colmap.get(key, key)
-        return self._raw.get(actual, default)
+        if actual not in self._raw:
+            return default
+        return self._read(actual)
 
     def __iter__(self):
         if not self._absent:
@@ -116,6 +122,6 @@ class RowProxy(Mapping[str, Any]):
                 return False
 
     def __str__(self) -> str:
-        return str(self._raw)
+        return str(self._raw | self._copied)
 
     __repr__ = __str__

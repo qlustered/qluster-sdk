@@ -4,4 +4,8 @@ python_test_utils(
     name="test_utils",
 )
 
-python_tests()
+python_tests(
+    overrides={
+        "test_readme.py": {"dependencies": ["qluster-sdk:readme"]},
+    },
+)
